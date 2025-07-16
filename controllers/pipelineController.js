@@ -1,3 +1,8 @@
+import { neon } from '@neondatabase/serverless';
+
+const sql = neon('postgresql://neondb_owner:npg_nyQXU3rBI2kV@ep-rapid-rain-adood2to-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require');
+
+const posts = await sql('SELECT * FROM posts');
 import * as pipelineService from '../services/pipelineService.js';
 
 export const pipelineHandler = async (req, res) => {

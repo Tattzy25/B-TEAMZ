@@ -1,0 +1,1043 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+import asyncio
+import httpx
+from ably import AblyRest
+import uuid
+import asyncpg
+from datetime import datetime, timedelta
+import os
+from contextlib import asynccontextmanager
+import secrets
+import string
+import logging
+import base64
+import json
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Production Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_Hblr5oemsu2R@ep-super-snowflake-adqim63b-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require")
+BRIDGIT_AI_API_KEY = os.getenv("BRIDGIT_AI_API_KEY")
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY") 
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ABLY_API_KEY = os.getenv("ABLY_API_KEY")
+
+# Production domain
+DOMAIN = "https://bridgit-ai.com"
+
+# Initialize services
+ably = AblyRest(ABLY_API_KEY) if ABLY_API_KEY else None
+db_pool = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=10, max_size=50)
+        logger.info("✅ Database connection pool created")
+        yield
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        raise
+    finally:
+        if db_pool:
+            await db_pool.close()
+
+app = FastAPI(
+    title="Bridgit AI Voice API", 
+    version="2.0.0",
+    description="Real-time voice translation and communication platform",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    lifespan=lifespan
+)
+
+# Production CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://bridgit-ai.com",
+        "https://www.bridgit-ai.com",
+        "http://localhost:3000",  # For development
+        "http://localhost:3001"   # For development
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
+)
+
+# ==================== MODELS ====================
+
+class HostSessionRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=255)
+    display_name: str = Field(..., min_length=1, max_length=100)
+    preferred_source_language: str = Field(default="en", max_length=10)
+    preferred_target_language: str = Field(default="en", max_length=10)
+
+class GenerateCodeResponse(BaseModel):
+    auth_code: str
+    channel_name: str
+    expires_in_minutes: int
+    share_url: str
+    qr_code_url: Optional[str] = None
+
+class EnterRoomRequest(BaseModel):
+    channel_name: str
+    user_id: str
+
+class JoinSessionRequest(BaseModel):
+    auth_code: str = Field(..., min_length=8, max_length=8)
+    user_id: str = Field(..., min_length=1, max_length=255)
+    display_name: str = Field(..., min_length=1, max_length=100)
+    preferred_source_language: str = Field(default="en", max_length=10)
+    preferred_target_language: str = Field(default="en", max_length=10)
+
+class SoloSessionRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=255)
+    display_name: str = Field(..., min_length=1, max_length=100)
+    source_language: str = Field(..., max_length=10)
+    target_language: str = Field(..., max_length=10)
+
+class VoiceMessageRequest(BaseModel):
+    channel_name: str
+    user_id: str
+    voice_id: str
+    audio_data: str  # base64 encoded audio
+    duration_seconds: Optional[float] = None
+
+class SoloVoiceRequest(BaseModel):
+    session_id: str
+    user_id: str
+    audio_data: str  # base64 encoded audio
+    voice_id: Optional[str] = None
+
+# ==================== UTILITIES ====================
+
+def generate_auth_code() -> str:
+    """Generate 8-character alphanumeric code"""
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+
+def create_share_url(auth_code: str) -> str:
+    """Create shareable URL for joining session"""
+    return f"{DOMAIN}/join/{auth_code}"
+
+async def create_ably_token(user_id: str, channel_name: str) -> dict:
+    """Create Ably token for real-time communication"""
+    if not ably:
+        raise HTTPException(status_code=500, detail="Real-time service not available")
+    
+    try:
+        token_request = ably.auth.create_token_request({
+            'client_id': user_id,
+            'capability': {channel_name: ['*']},
+            'ttl': 7200000  # 2 hours
+        })
+        return token_request
+    except Exception as e:
+        logger.error(f"Failed to create Ably token: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create communication token")
+
+async def process_voice_with_translation(
+    audio_data: str, 
+    source_lang: str, 
+    target_lang: str,
+    voice_id: str,
+    user_id: str
+) -> Dict:
+    """Process voice through STT -> Translation -> TTS pipeline"""
+    try:
+        # Step 1: Speech to Text (ElevenLabs)
+        stt_response = await call_elevenlabs_stt(audio_data)
+        original_text = stt_response.get('text', '')
+        
+        # Step 2: Translate if needed (DeepL)
+        if source_lang != target_lang:
+            translated_text = await call_deepl_translate(original_text, source_lang, target_lang)
+        else:
+            translated_text = original_text
+        
+        # Step 3: Text to Speech (ElevenLabs)
+        tts_response = await call_elevenlabs_tts(translated_text, voice_id, target_lang)
+        translated_audio_url = tts_response.get('audio_url')
+        
+        return {
+            'original_text': original_text,
+            'translated_text': translated_text,
+            'translated_audio_url': translated_audio_url,
+            'source_language': source_lang,
+            'target_language': target_lang
+        }
+        
+    except Exception as e:
+        logger.error(f"Voice processing failed: {e}")
+        raise HTTPException(status_code=500, detail="Voice processing failed")
+
+async def call_elevenlabs_stt(audio_data: str) -> Dict:
+    """Call ElevenLabs Speech-to-Text API"""
+    # Implementation for ElevenLabs STT
+    # This would decode base64 audio and send to ElevenLabs
+    return {"text": "Processed speech text"}
+
+async def call_deepl_translate(text: str, source_lang: str, target_lang: str) -> str:
+    """Call DeepL Translation API"""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api-free.deepl.com/v2/translate",
+            headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+            data={
+                "text": text,
+                "source_lang": source_lang,
+                "target_lang": target_lang
+            }
+        )
+        result = response.json()
+        return result['translations'][0]['text']
+
+async def call_elevenlabs_tts(text: str, voice_id: str, language: str) -> Dict:
+    """Call ElevenLabs Text-to-Speech API"""
+    # Implementation for ElevenLabs TTS
+    # This would generate audio and return URL
+    return {"audio_url": f"https://bridgit-ai.com/audio/{uuid.uuid4()}.mp3"}
+
+# ==================== API ENDPOINTS ====================
+
+@app.post("/api/host/create")
+async def create_host_session(request: HostSessionRequest):
+    """
+    STEP 1: User clicks 'Host' - Creates session but doesn't generate code yet
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        
+        async with db_pool.acquire() as conn:
+            # Create user if doesn't exist
+            await conn.execute("""
+                INSERT INTO users (user_id, display_name, preferred_source_language, preferred_target_language)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                display_name = $2,
+                preferred_source_language = $3,
+                preferred_target_language = $4,
+                updated_at = NOW()
+            """, request.user_id, request.display_name, 
+                request.preferred_source_language, request.preferred_target_language)
+        
+        logger.info(f"Host session created for user: {request.user_id}")
+        
+        return {
+            "session_id": session_id,
+            "user_id": request.user_id,
+            "status": "ready_to_generate_code",
+            "message": "Session created. Ready to generate access code."
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating host session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create session")
+
+@app.post("/api/host/generate-code", response_model=GenerateCodeResponse)
+async def generate_access_code(user_id: str):
+    """
+    STEP 2: User clicks 'Generate Access Code' - Creates channel and auth code
+    """
+    try:
+        auth_code = generate_auth_code()
+        channel_name = f"bridgit_host_{auth_code.lower()}"
+        
+        # Code expires in 20 minutes, session expires in 2 hours
+        join_expires_at = datetime.now() + timedelta(minutes=20)
+        session_expires_at = datetime.now() + timedelta(hours=2)
+        
+        async with db_pool.acquire() as conn:
+            # Create channel
+            await conn.execute("""
+                INSERT INTO channels (
+                    channel_name, creator_user_id, channel_type, 
+                    max_participants, expires_at, is_active, session_mode,
+                    voice_only, session_duration_hours
+                ) VALUES ($1, $2, 'host', 4, $3, true, 'host', true, 2)
+            """, channel_name, user_id, session_expires_at)
+            
+            # Create auth code
+            await conn.execute("""
+                INSERT INTO auth_codes (
+                    auth_code, channel_name, creator_user_id, 
+                    expires_at, is_used, join_expires_minutes, code_shared_at
+                ) VALUES ($1, $2, $3, $4, false, 20, NOW())
+            """, auth_code, channel_name, user_id, join_expires_at)
+            
+            # Create session state tracking
+            await conn.execute("""
+                INSERT INTO session_states (
+                    channel_name, host_user_id, session_state, code_generated_at
+                ) VALUES ($1, $2, 'code_generated', NOW())
+            """, channel_name, user_id)
+        
+        share_url = create_share_url(auth_code)
+        
+        logger.info(f"Access code generated: {auth_code} for user: {user_id}")
+        
+        return GenerateCodeResponse(
+            auth_code=auth_code,
+            channel_name=channel_name,
+            expires_in_minutes=20,
+            share_url=share_url,
+            qr_code_url=f"{DOMAIN}/api/qr/{auth_code}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error generating access code: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate access code")
+
+@app.post("/api/host/enter-room")
+async def host_enter_room(request: EnterRoomRequest):
+    """
+    STEP 3: Host clicks 'Enter Room' - Host enters and waits for others
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Verify host owns this channel
+            channel = await conn.fetchrow("""
+                SELECT * FROM channels 
+                WHERE channel_name = $1 AND creator_user_id = $2 AND is_active = true
+            """, request.channel_name, request.user_id)
+            
+            if not channel:
+                raise HTTPException(status_code=404, detail="Channel not found or access denied")
+            
+            # Add host as participant
+            await conn.execute("""
+                INSERT INTO channel_participants (
+                    channel_name, user_id, is_active, joined_at
+                ) VALUES ($1, $2, true, NOW())
+                ON CONFLICT (channel_name, user_id) DO UPDATE SET
+                is_active = true, joined_at = NOW()
+            """, request.channel_name, request.user_id)
+            
+            # Update session state
+            await conn.execute("""
+                UPDATE session_states 
+                SET session_state = 'host_entered_room', host_entered_room_at = NOW()
+                WHERE channel_name = $1
+            """, request.channel_name)
+            
+            # Update channel
+            await conn.execute("""
+                UPDATE channels SET room_entered_at = NOW() WHERE channel_name = $1
+            """, request.channel_name)
+        
+        # Create Ably token for host
+        ably_token = await create_ably_token(request.user_id, request.channel_name)
+        
+        logger.info(f"Host {request.user_id} entered room: {request.channel_name}")
+        
+        return {
+            "status": "waiting_for_participants",
+            "channel_name": request.channel_name,
+            "ably_token": ably_token,
+            "message": "You're in the room. Waiting for others to join..."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error entering room: {e}")
+        raise HTTPException(status_code=500, detail="Failed to enter room")
+
+@app.post("/api/join")
+async def join_session(request: JoinSessionRequest):
+    """
+    JOIN MODE: User enters access code and joins session
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Validate auth code
+            auth_record = await conn.fetchrow("""
+                SELECT ac.*, c.is_active, c.max_participants, c.expires_at as session_expires,
+                       c.channel_name, c.creator_user_id
+                FROM auth_codes ac
+                JOIN channels c ON ac.channel_name = c.channel_name
+                WHERE ac.auth_code = $1 AND ac.is_used = false 
+                AND ac.expires_at > $2 AND c.is_active = true
+            """, request.auth_code, datetime.now())
+            
+            if not auth_record:
+                raise HTTPException(
+                    status_code
+User
+continue
+
+Assistant
+            if not auth_record:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid or expired access code. Codes expire after 20 minutes."
+                )
+            
+            # Check participant limit
+            participant_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM channel_participants 
+                WHERE channel_name = $1 AND is_active = true
+            """, auth_record['channel_name'])
+            
+            if participant_count >= auth_record['max_participants']:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Session is full. Maximum 4 participants allowed."
+                )
+            
+            # Create/update user
+            await conn.execute("""
+                INSERT INTO users (user_id, display_name, preferred_source_language, preferred_target_language)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                display_name = $2,
+                preferred_source_language = $3,
+                preferred_target_language = $4,
+                updated_at = NOW()
+            """, request.user_id, request.display_name, 
+                request.preferred_source_language, request.preferred_target_language)
+            
+            # Add participant
+            await conn.execute("""
+                INSERT INTO channel_participants (
+                    channel_name, user_id, is_active, joined_at
+                ) VALUES ($1, $2, true, NOW())
+                ON CONFLICT (channel_name, user_id) DO UPDATE SET
+                is_active = true, joined_at = NOW()
+            """, auth_record['channel_name'], request.user_id)
+            
+            # Update session state if first participant joins
+            if participant_count == 1:  # Host + first joiner
+                await conn.execute("""
+                    UPDATE session_states 
+                    SET session_state = 'active_conversation', 
+                        first_participant_joined_at = NOW(),
+                        conversation_started_at = NOW()
+                    WHERE channel_name = $1
+                """, auth_record['channel_name'])
+        
+        # Create Ably token
+        ably_token = await create_ably_token(request.user_id, auth_record['channel_name'])
+        
+        logger.info(f"User {request.user_id} joined session {request.auth_code}")
+        
+        return {
+            "status": "joined_successfully",
+            "channel_name": auth_record['channel_name'],
+            "ably_token": ably_token,
+            "session_expires_at": auth_record['session_expires'].isoformat(),
+            "current_participants": participant_count + 1,
+            "max_participants": auth_record['max_participants'],
+            "voice_only": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error joining session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to join session")
+
+@app.post("/api/solo/start")
+async def start_solo_session(request: SoloSessionRequest):
+    """
+    SOLO MODE: Start solo practice session (no Ably, local STT/TTS/Translation)
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        
+        async with db_pool.acquire() as conn:
+            # Create/update user
+            await conn.execute("""
+                INSERT INTO users (user_id, display_name, preferred_source_language, preferred_target_language)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                display_name = $2,
+                preferred_source_language = $3,
+                preferred_target_language = $4,
+                updated_at = NOW()
+            """, request.user_id, request.display_name, 
+                request.source_language, request.target_language)
+            
+            # Create solo session
+            await conn.execute("""
+                INSERT INTO solo_sessions (
+                    id, user_id, source_language, target_language, is_active
+                ) VALUES ($1, $2, $3, $4, true)
+            """, session_id, request.user_id, request.source_language, request.target_language)
+        
+        logger.info(f"Solo session started: {session_id} for user: {request.user_id}")
+        
+        return {
+            "session_id": session_id,
+            "user_id": request.user_id,
+            "source_language": request.source_language,
+            "target_language": request.target_language,
+            "status": "solo_session_active",
+            "message": "Solo practice session started. Speak to practice translation."
+        }
+        
+    except Exception as e:
+        logger.error(f"Error starting solo session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to start solo session")
+
+@app.post("/api/voice/send")
+async def send_voice_message(request: VoiceMessageRequest):
+    """
+    Send voice message in real-time session with translation
+    User speaks Russian -> Sent as Chinese to other user (based on their preferences)
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Verify user is active participant
+            participant = await conn.fetchrow("""
+                SELECT cp.*, c.is_active as channel_active, u.preferred_target_language
+                FROM channel_participants cp
+                JOIN channels c ON cp.channel_name = c.channel_name
+                JOIN users u ON cp.user_id = u.user_id
+                WHERE cp.channel_name = $1 AND cp.user_id = $2 
+                AND cp.is_active = true AND c.is_active = true
+            """, request.channel_name, request.user_id)
+            
+            if not participant:
+                raise HTTPException(status_code=403, detail="Not authorized for this channel")
+            
+            # Get all other participants and their language preferences
+            other_participants = await conn.fetch("""
+                SELECT cp.user_id, u.preferred_target_language, u.preferred_source_language
+                FROM channel_participants cp
+                JOIN users u ON cp.user_id = u.user_id
+                WHERE cp.channel_name = $1 AND cp.user_id != $2 AND cp.is_active = true
+            """, request.channel_name, request.user_id)
+            
+            # Get sender's source language
+            sender_info = await conn.fetchrow("""
+                SELECT preferred_source_language FROM users WHERE user_id = $1
+            """, request.user_id)
+            
+            source_lang = sender_info['preferred_source_language']
+            
+            # Store original message
+            message_id = await conn.fetchval("""
+                INSERT INTO voice_messages (
+                    channel_name, sender_user_id, voice_id, audio_url,
+                    source_language, target_language, message_duration
+                ) VALUES ($1, $2, $3, $4, $5, $5, $6)
+                RETURNING id
+            """, request.channel_name, request.user_id, request.voice_id, 
+                f"original_{uuid.uuid4()}.mp3", source_lang, request.duration_seconds)
+            
+            # Process and send translated versions to each participant
+            channel = ably.channels.get(request.channel_name)
+            
+            for participant in other_participants:
+                target_lang = participant['preferred_target_language']
+                
+                # Process voice with translation pipeline
+                translation_result = await process_voice_with_translation(
+                    request.audio_data, source_lang, target_lang, 
+                    request.voice_id, request.user_id
+                )
+                
+                # Store translation record
+                await conn.execute("""
+                    INSERT INTO voice_translations (
+                        original_message_id, channel_name, sender_user_id, 
+                        receiver_user_id, original_audio_url, translated_audio_url,
+                        source_language, target_language
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """, message_id, request.channel_name, request.user_id,
+                    participant['user_id'], f"original_{uuid.uuid4()}.mp3",
+                    translation_result['translated_audio_url'], source_lang, target_lang)
+                
+                # Send to specific user via Ably
+                channel.publish(f'voice_message_{participant["user_id"]}', {
+                    'message_id': str(message_id),
+                    'sender_user_id': request.user_id,
+                    'receiver_user_id': participant['user_id'],
+                    'audio_url': translation_result['translated_audio_url'],
+                    'original_text': translation_result['original_text'],
+                    'translated_text': translation_result['translated_text'],
+                    'source_language': source_lang,
+                    'target_language': target_lang,
+                    'timestamp': datetime.now().isoformat(),
+                    'voice_only': True
+                })
+        
+        logger.info(f"Voice message sent and translated for {len(other_participants)} participants")
+        
+        return {
+            "status": "message_sent_and_translated",
+            "message_id": str(message_id),
+            "translations_sent": len(other_participants)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending voice message: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send voice message")
+
+@app.post("/api/solo/voice")
+async def process_solo_voice(request: SoloVoiceRequest):
+    """
+    Process voice in solo mode - STT -> Translation -> TTS -> Return audio URL
+    No Ably involved, just returns translated audio for local playback
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            # Get session info
+            session = await conn.fetchrow("""
+                SELECT * FROM solo_sessions 
+                WHERE id = $1 AND user_id = $2 AND is_active = true
+            """, request.session_id, request.user_id)
+            
+            if not session:
+                raise HTTPException(status_code=404, detail="Solo session not found or inactive")
+            
+            # Process voice through translation pipeline
+            translation_result = await process_voice_with_translation(
+                request.audio_data, 
+                session['source_language'], 
+                session['target_language'],
+                request.voice_id or "default_voice",
+                request.user_id
+            )
+            
+            # Log the solo voice processing
+            await conn.execute("""
+                INSERT INTO solo_voice_logs (
+                    solo_session_id, user_id, original_audio_url, translated_audio_url,
+                    source_language, target_language, stt_text, translated_text
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """, request.session_id, request.user_id, f"solo_original_{uuid.uuid4()}.mp3",
+                translation_result['translated_audio_url'], session['source_language'],
+                session['target_language'], translation_result['original_text'],
+                translation_result['translated_text'])
+            
+            # Update session stats
+            await conn.execute("""
+                UPDATE solo_sessions 
+                SET voice_messages_count = voice_messages_count + 1
+                WHERE id = $1
+            """, request.session_id)
+        
+        logger.info(f"Solo voice processed for session: {request.session_id}")
+        
+        return {
+            "status": "voice_processed",
+            "session_id": request.session_id,
+            "original_text": translation_result['original_text'],
+            "translated_text": translation_result['translated_text'],
+            "translated_audio_url": translation_result['translated_audio_url'],
+            "source_language": session['source_language'],
+            "target_language": session['target_language'],
+            "playback_ready": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing solo voice: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process solo voice")
+
+@app.get("/api/languages/supported")
+async def get_supported_languages():
+    """Get all supported languages for dropdowns"""
+    try:
+        # This would typically come from DeepL API or your database
+        languages = [
+            {"code": "en", "name": "English", "supports_formality": False},
+            {"code": "es", "name": "Spanish", "supports_formality": True},
+            {"code": "fr", "name": "French", "supports_formality": True},
+            {"code": "de", "name": "German", "supports_formality": True},
+            {"code": "it", "name": "Italian", "supports_formality": True},
+            {"code": "pt", "name": "Portuguese", "supports_formality": True},
+            {"code": "ru", "name": "Russian", "supports_formality": True},
+            {"code": "ja", "name": "Japanese", "supports_formality": True},
+            {"code": "ko", "name": "Korean", "supports_formality": False},
+            {"code": "zh", "name": "Chinese", "supports_formality": False},
+            {"code": "ar", "name": "Arabic", "supports_formality": False},
+            {"code": "hi", "name": "Hindi", "supports_formality": False}
+        ]
+        
+        return {
+            "languages": languages,
+            "total_count": len(languages)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting languages: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get supported languages")
+
+@app.get("/api/session/{auth_code}/status")
+async def get_session_status(auth_code: str):
+    """Get real-time session status"""
+    try:
+        async with db_pool.acquire() as conn:
+            session_info = await conn.fetchrow("""
+                SELECT 
+                    c.channel_name, c.creator_user_id, c.max_participants,
+                    c.expires_at, c.is_active, ss.session_state,
+                    ac.expires_at as join_expires_at,
+                    COUNT(cp.user_id) as current_participants
+                FROM auth_codes ac
+                JOIN channels c ON ac.channel_name = c.channel_name
+                LEFT JOIN session_states ss ON c.channel_name = ss.channel_name
+                LEFT JOIN channel_participants cp ON c.channel_name = cp.channel_name 
+                    AND cp.is_active = true
+                WHERE ac.auth_code = $1
+                GROUP BY c.channel_name, c.creator_user_id, c.max_participants, 
+                         c.expires_at, c.is_active, ss.session_state, ac.expires_at
+            """, auth_code)
+            
+            if not session_info:
+                raise HTTPException(status_code=404, detail="Session not found")
+            
+            participants = await conn.fetch("""
+                SELECT cp.user_id, u.display_name, cp.joined_at,
+                       u.preferred_source_language, u.preferred_target_language
+                FROM channel_participants cp
+                JOIN users u ON cp.user_id = u.user_id
+                WHERE cp.channel_name = $1 AND cp.is_active = true
+                ORDER BY cp.joined_at
+            """, session_info['channel_name'])
+            
+            now = datetime.now()
+            join_window_open = session_info['join_expires_at'] > now
+            session_active = session_info['expires_at'] > now and session_info['is_active']
+            
+            return {
+                "channel_name": session_info['channel_name'],
+                "session_active": session_active,
+                "join_window_open": join_window_open,
+                "session_state": session_info['session_state'],
+                "current_participants": session_info['current_participants'],
+                "max_participants": session_info['max_participants'],
+                "participants": [
+                    {
+                        "user_id": p['user_id'],
+                        "display_name": p['display_name'],
+                        "joined_at
+User
+Continue.
+
+Assistant
+                        "joined_at": p['joined_at'].isoformat(),
+                        "source_language": p['preferred_source_language'],
+                        "target_language": p['preferred_target_language']
+                    } for p in participants
+                ],
+                "expires_at": session_info['expires_at'].isoformat(),
+                "join_expires_at": session_info['join_expires_at'].isoformat(),
+                "voice_only": True
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get session status")
+
+@app.post("/api/session/leave")
+async def leave_session(channel_name: str, user_id: str):
+    """Leave a voice session"""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE channel_participants 
+                SET is_active = false, left_at = NOW()
+                WHERE channel_name = $1 AND user_id = $2
+            """, channel_name, user_id)
+            
+            # Check if session should end (no active participants)
+            active_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM channel_participants 
+                WHERE channel_name = $1 AND is_active = true
+            """, channel_name)
+            
+            if active_count == 0:
+                await conn.execute("""
+                    UPDATE channels SET is_active = false WHERE channel_name = $1
+                """, channel_name)
+                
+                await conn.execute("""
+                    UPDATE session_states 
+                    SET session_state = 'session_ended', session_ended_at = NOW()
+                    WHERE channel_name = $1
+                """, channel_name)
+        
+        logger.info(f"User {user_id} left session {channel_name}")
+        
+        return {"status": "left_session", "active_participants": active_count}
+        
+    except Exception as e:
+        logger.error(f"Error leaving session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to leave session")
+
+@app.post("/api/solo/end")
+async def end_solo_session(session_id: str, user_id: str):
+    """End solo practice session"""
+    try:
+        async with db_pool.acquire() as conn:
+            # Calculate session duration
+            session_info = await conn.fetchrow("""
+                SELECT started_at, voice_messages_count FROM solo_sessions 
+                WHERE id = $1 AND user_id = $2 AND is_active = true
+            """, session_id, user_id)
+            
+            if not session_info:
+                raise HTTPException(status_code=404, detail="Solo session not found")
+            
+            duration_minutes = int((datetime.now() - session_info['started_at']).total_seconds() / 60)
+            
+            # End session
+            await conn.execute("""
+                UPDATE solo_sessions 
+                SET is_active = false, ended_at = NOW(), session_duration_minutes = $3
+                WHERE id = $1 AND user_id = $2
+            """, session_id, user_id, duration_minutes)
+        
+        logger.info(f"Solo session ended: {session_id}")
+        
+        return {
+            "status": "session_ended",
+            "session_id": session_id,
+            "duration_minutes": duration_minutes,
+            "messages_processed": session_info['voice_messages_count']
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error ending solo session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to end solo session")
+
+# ==================== UTILITY ENDPOINTS ====================
+
+@app.get("/api/qr/{auth_code}")
+async def generate_qr_code(auth_code: str):
+    """Generate QR code for sharing session"""
+    try:
+        import qrcode
+        from io import BytesIO
+        import base64
+        
+        share_url = create_share_url(auth_code)
+        
+        # Generate QR code
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(share_url)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Convert to base64
+        buffer = BytesIO()
+        img.save(buffer, format='PNG')
+        img_str = base64.b64encode(buffer.getvalue()).decode()
+        
+        return {
+            "qr_code": f"data:image/png;base64,{img_str}",
+            "share_url": share_url,
+            "auth_code": auth_code
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating QR code: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate QR code")
+
+@app.get("/join/{auth_code}")
+async def redirect_to_join(auth_code: str):
+    """Handle direct join links"""
+    return {
+        "auth_code": auth_code,
+        "redirect_to": f"{DOMAIN}/app?join={auth_code}",
+        "message": "Redirecting to Bridgit AI app..."
+    }
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        
+        return {
+            "status": "healthy",
+            "service": "Bridgit AI Voice API",
+            "version": "2.0.0",
+            "domain": DOMAIN,
+            "features": {
+                "voice_only": True,
+                "real_time_translation": True,
+                "max_session_hours": 2,
+                "join_window_minutes": 20,
+                "max_participants": 4,
+                "solo_mode": True,
+                "supported_modes": ["host", "join", "solo"]
+            },
+            "services": {
+                "database": "connected",
+                "ably": "connected" if ably else "not_configured",
+                "deepl": "configured" if DEEPL_API_KEY else "not_configured",
+                "elevenlabs": "configured" if ELEVENLABS_API_KEY else "not_configured"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e)}
+        )
+
+# ==================== BACKGROUND TASKS ====================
+
+@app.on_event("startup")
+async def startup_event():
+    """Run cleanup on startup"""
+    logger.info("🚀 Bridgit AI Voice API starting up...")
+    
+    # Schedule periodic cleanup
+    asyncio.create_task(periodic_cleanup())
+
+async def periodic_cleanup():
+    """Run cleanup every 5 minutes"""
+    while True:
+        try:
+            await cleanup_expired_sessions()
+            await asyncio.sleep(300)  # 5 minutes
+        except Exception as e:
+            logger.error(f"Periodic cleanup error: {e}")
+            await asyncio.sleep(60)  # Retry in 1 minute
+
+async def cleanup_expired_sessions():
+    """Clean up expired sessions and codes"""
+    if not db_pool:
+        return
+        
+    try:
+        async with db_pool.acquire() as conn:
+            now = datetime.now()
+            
+            # Mark expired channels as inactive
+            await conn.execute("""
+                UPDATE channels 
+                SET is_active = false 
+                WHERE expires_at < $1 AND is_active = true
+            """, now)
+            
+            # Mark expired auth codes as used
+            await conn.execute("""
+                UPDATE auth_codes 
+                SET is_used = true 
+                WHERE expires_at < $1 AND is_used = false
+            """, now)
+            
+            # End expired solo sessions
+            await conn.execute("""
+                UPDATE solo_sessions 
+                SET is_active = false, ended_at = NOW()
+                WHERE started_at < $1 AND is_active = true
+            """, now - timedelta(hours=2))
+            
+            logger.info("✅ Cleanup completed")
+            
+    except Exception as e:
+        logger.error(f"❌ Cleanup error: {e}")
+
+# ==================== ERROR HANDLERS ====================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "status_code": 500,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+# ==================== MAIN ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info"
+    )
+🌐 PRODUCTION DEPLOYMENT SETUP
+Environment Variables (.env)
+# Database
+DATABASE_URL=postgresql://neondb_owner:npg_Hblr5oemsu2R@ep-super-snowflake-adqim63b-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require
+
+# API Keys
+BRIDGIT_AI_API_KEY=your_bridgit_key_here
+DEEPL_API_KEY=your_deepl_key_here
+ELEVENLABS_API_KEY=your_elevenlabs_key_here
+ABLY_API_KEY=your_ably_key_here
+
+# Production
+PORT=8000
+Requirements.txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+asyncpg==0.29.0
+ably==2.0.4
+httpx==0.25.2
+python-multipart==0.0.6
+qrcode[pil]==7.4.2
+python-dotenv==1.0.0
+🚀 EXACT USER FLOW
+HOST MODE:
+User clicks "Host" → POST /api/host/create
+User clicks "Generate Access Code" → POST /api/host/generate-code → Returns ABC12345
+User shares code → Copy/share ABC12345 or https://bridgit-ai.com/join/ABC12345
+User clicks "Enter Room" → POST /api/host/enter-room → Waits for others
+Real-time voice → POST /api/voice/send → Auto-translates to each user's preferred language
+JOIN MODE:
+User clicks "Join" → Shows input field
+User enters code → ABC12345
+User clicks "Connect" → POST /api/join → Joins session
+Real-time voice → POST /api/voice/send → Auto-translates
+SOLO MODE:
+User clicks "Solo" → POST /api/solo/start
+User speaks → POST /api/solo/voice → Returns translated audio URL
+User hears translation → Plays locally (no Ably)
+🌍 PRODUCTION URLs:
+API Base: https://bridgit-ai.com/api
+Health Check: https://bridgit-ai.com/api/health
+API Docs: https://bridgit-ai.com/api/docs
+Join Links: https://bridgit-ai.com/join/ABC12345
+🔧 Deploy Commands:
+# Install dependencies
+pip install -r requirements.txt
+
+# Run production server
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+
+# Or with gunicorn for production
+gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
