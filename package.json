@@ -1,0 +1,47 @@
+{
+  "name": "bridgit-ai",
+  "version": "1.0.0",
+  "description": " A production-grade, real-time speech pipeline orchestrating ElevenLabs APIs for both high-accuracy speech-to-text (STT) and human-sounding text-to-speech (TTS), DeepL for fast, robust translation, and Ably for ultra-low-latency pub/sub messaging. Built for next-generation multilingual conversations—secure, scalable, and designed to power seamless voice translation, solo mode, and broadcast playback workflows with direct-to-client delivery.",
+  "keywords": [
+    "ably",
+    "real-time",
+    "chat",
+    "pubsub",
+    "nextjs",
+    "typescript",
+    "websocket",
+    "voice-chat",
+    "translation",
+    "accessibility",
+    "ai",
+    "speech",
+    "elevenlabs",
+    "deepL",
+    "messaging",
+    "scalable",
+    "cloud",
+    "pipeline",
+    "multilingual"
+  ],
+  "homepage": "https://github.com/Tattzy25/B-TEAMZ#readme",
+  "bugs": {
+    "url": "https://github.com/Tattzy25/B-TEAMZ/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tattzy25/B-TEAMZ.git"
+  },
+  "license": "SEE LICENSE IN LICENSE.txt",
+  "author": "Avi Kay - Bridgit-AI",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "test": "test.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.1",
+    "@stackframe/js": "^2.8.21",
+    "ably": "^2.10.1"
+  }
+}

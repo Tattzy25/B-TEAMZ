@@ -1,9 +1,10 @@
 import asyncio
+import os
 import asyncpg
 
-NEON_DB_URL = "postgresql://neondb_owner:npg_Hblr5oemsu2R@ep-super-snowflake-adqim63b-pooler.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"
+NEON_DB_URL = os.getenv("NEON_DATABASE_URL")
 
-async def table_info():
+async def main():
     conn = await asyncpg.connect(NEON_DB_URL)
     tables = await conn.fetch(
         """
